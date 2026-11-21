@@ -1,10 +1,8 @@
-# Experimental harness: both jobs test the SAME pinned real fix, not this PR's
-# workflow edit. Production planning must still treat workflow changes as risky.
-name: Smart CI / date-fns end-to-end timing
+# Compare the actual PR revision across native, previous and optimized execution.
+name: Smart CI / optimized date-fns PR comparison
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths: ['.github/workflows/smartci-timing.yml']
 permissions:
   contents: read
 concurrency:
@@ -17,15 +15,21 @@ jobs:
     timeout-minutes: 10
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 3
       matrix:
-        variant: [native, smartci]
+        include:
+          - variant: native
+            tool_ref: 456ddca0b02ec4c7ad34bafd8a6310d9cdf83d29
+          - variant: previous
+            tool_ref: 456ddca0b02ec4c7ad34bafd8a6310d9cdf83d29
+          - variant: smartci
+            tool_ref: 721ad87ec7416a850a714267499b7d46384fa1a3
     name: timing (${{ matrix.variant }})
     steps:
-      - name: Check out fixed application revision
+      - name: Check out actual PR revision
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: 53b644aa2bbf50007fbeab83e6d92477867012cb
+          ref: ${{ github.sha }}
           path: app
           # Native full execution needs no history; Smart CI genuinely does.
           fetch-depth: ${{ matrix.variant == 'native' && 1 || 0 }}
@@ -41,24 +45,24 @@ jobs:
             --dir app install --frozen-lockfile \
             --store-dir "$RUNNER_TEMP/pnpm-store" --cache-dir "$RUNNER_TEMP/pnpm-cache"
       - name: Check out pinned Smart CI
-        if: matrix.variant == 'smartci'
+        if: matrix.variant != 'native'
         id: control
         continue-on-error: true
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           repository: SharmaKunal14/smart-ci
-          ref: 456ddca0b02ec4c7ad34bafd8a6310d9cdf83d29
+          ref: ${{ matrix.tool_ref }}
           path: control
           persist-credentials: false
       - name: Set up Python
-        if: matrix.variant == 'smartci'
+        if: matrix.variant != 'native'
         id: python
         continue-on-error: true
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.14'
       - name: Set up uv
-        if: matrix.variant == 'smartci'
+        if: matrix.variant != 'native'
         id: uv
         continue-on-error: true
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
@@ -67,17 +71,24 @@ jobs:
           enable-cache: false
       - name: Install pinned Smart CI
         id: tool
-        if: matrix.variant == 'smartci' && steps.control.outcome == 'success' && steps.python.outcome == 'success' && steps.uv.outcome == 'success'
+        if: matrix.variant != 'native' && steps.control.outcome == 'success' && steps.python.outcome == 'success' && steps.uv.outcome == 'success'
         continue-on-error: true
         working-directory: control
-        run: uv sync --frozen
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          if [[ "$VARIANT" == smartci ]]; then
+            uv sync --frozen --no-dev
+          else
+            uv sync --frozen
+          fi
       - name: Run measured test command
         id: tests
         continue-on-error: true
         env:
           VARIANT: ${{ matrix.variant }}
           TOOL_READY: ${{ steps.tool.outcome }}
-          BASE_SHA: f953bd6ba07c01b2456808d4ae3df90bcfeeddd2
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TZ: UTC
         run: |
           python3 - <<'PY'
@@ -95,7 +106,7 @@ jobs:
                   '--project', 'main', '--reporter=json',
                   f'--outputFile={temporary / "native-full.json"}']
           fallback = False
-          if variant == 'smartci' and os.environ['TOOL_READY'] == 'success':
+          if variant != 'native' and os.environ['TOOL_READY'] == 'success':
               command = [str(root / 'control/.venv/bin/smartci'), 'typescript', 'run',
                          '--repo', str(root / 'app'),
                          '--config', str(root / 'control/examples/date-fns/typescript.json'),
@@ -111,7 +122,7 @@ jobs:
           else:
               status = 2
           if variant == 'native' or status not in (0, 1):
-              fallback = variant == 'smartci'
+              fallback = variant != 'native'
               status = subprocess.run(full, cwd=root / 'app/pkgs/core',
                                       check=False, timeout=180).returncode
           (temporary / 'command-time.json').write_text(json.dumps({
