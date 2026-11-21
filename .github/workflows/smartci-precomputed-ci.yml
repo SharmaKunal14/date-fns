@@ -1,0 +1,334 @@
+# Compare the actual PR revision across native, previous and optimized execution.
+name: Smart CI / precomputed map PR comparison
+on:
+  pull_request:
+    branches: [codex/smartci-precomputed-base, codex/smartci-precomputed-fix]
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+concurrency:
+  group: smartci-date-fns-timing-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  fetch-map:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha256: ${{ steps.fetch.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: SharmaKunal14/smart-ci
+          ref: fa7cb1994b98f0c2ddd0e83dd603eb9d127f6f41
+          path: control
+          persist-credentials: false
+      - name: Authenticate producer and download exact base map
+        id: fetch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        run: |
+          python3 control/scripts/fetch_typescript_map.py \
+            --repository SharmaKunal14/date-fns --commit "$BASE_SHA" --branch "$BASE_BRANCH" \
+            --workflow .github/workflows/smartci-precompute.yml \
+            --publisher-template control/examples/date-fns/precompute.yml.in \
+            --tool-repository SharmaKunal14/smart-ci --tool-ref fa7cb1994b98f0c2ddd0e83dd603eb9d127f6f41 \
+            --output "$RUNNER_TEMP/base-map.json" > "$RUNNER_TEMP/receipt.json"
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          receipt = json.loads((Path(os.environ['RUNNER_TEMP']) / 'receipt.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('sha256=' + receipt['sha256'] + '\n')
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: steps.fetch.outcome == 'success'
+        with:
+          name: verified-base-map-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/base-map.json
+            ${{ runner.temp }}/receipt.json
+          retention-days: 3
+          if-no-files-found: error
+  baseline:
+    if: github.repository == 'SharmaKunal14/date-fns'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        variant: [native, rebuild]
+    name: timing (${{ matrix.variant }})
+    steps:
+      - name: Check out actual PR revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          path: app
+          # Native full execution needs no history; Smart CI genuinely does.
+          fetch-depth: ${{ matrix.variant == 'native' && 1 || 0 }}
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '26.13.1'
+      - name: Install pinned package manager and native dependencies
+        run: |
+          npm install --prefix "$RUNNER_TEMP/package-manager" pnpm@12.21.0
+          node "$RUNNER_TEMP/package-manager/node_modules/pnpm/bin/pnpm.mjs" \
+            --dir app install --frozen-lockfile \
+            --store-dir "$RUNNER_TEMP/pnpm-store" --cache-dir "$RUNNER_TEMP/pnpm-cache"
+      - name: Check out pinned Smart CI
+        if: matrix.variant != 'native'
+        id: control
+        continue-on-error: true
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: SharmaKunal14/smart-ci
+          ref: fa7cb1994b98f0c2ddd0e83dd603eb9d127f6f41
+          path: control
+          persist-credentials: false
+      - name: Set up Python
+        if: matrix.variant != 'native'
+        id: python
+        continue-on-error: true
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.14'
+      - name: Set up uv
+        if: matrix.variant != 'native'
+        id: uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: '0.11.6'
+          enable-cache: false
+      - name: Install pinned Smart CI
+        id: tool
+        if: matrix.variant != 'native' && steps.control.outcome == 'success' && steps.python.outcome == 'success' && steps.uv.outcome == 'success'
+        continue-on-error: true
+        working-directory: control
+        run: uv sync --frozen --no-dev
+      - name: Run measured test command
+        id: tests
+        continue-on-error: true
+        env:
+          VARIANT: ${{ matrix.variant }}
+          TOOL_READY: ${{ steps.tool.outcome }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TZ: UTC
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+          from pathlib import Path
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          temporary = Path(os.environ['RUNNER_TEMP'])
+          variant = os.environ['VARIANT']
+          start = time.monotonic()
+          full = ['node', '../../node_modules/vitest/vitest.mjs', 'run',
+                  '--project', 'main', '--reporter=json',
+                  f'--outputFile={temporary / "native-full.json"}']
+          fallback = False
+          if variant != 'native' and os.environ['TOOL_READY'] == 'success':
+              command = [str(root / 'control/.venv/bin/smartci'), 'typescript', 'run',
+                         '--repo', str(root / 'app'),
+                         '--config', str(root / 'control/examples/date-fns/typescript.json'),
+                         '--base', os.environ['BASE_SHA'],
+                         '--output', str(temporary / 'smartci-result'),
+                         '--pnpm', str(temporary / 'package-manager/node_modules/pnpm/bin/pnpm.mjs'),
+                         '--dependency-store', str(temporary / 'pnpm-store'),
+                         '--dependency-cache', str(temporary / 'pnpm-cache')]
+              try:
+                  status = subprocess.run(command, check=False, timeout=300).returncode
+              except (OSError, subprocess.TimeoutExpired):
+                  status = 2
+          else:
+              status = 2
+          if variant == 'native' or status not in (0, 1):
+              fallback = variant != 'native'
+              status = subprocess.run(full, cwd=root / 'app/pkgs/core',
+                                      check=False, timeout=180).returncode
+          (temporary / 'command-time.json').write_text(json.dumps({
+              'variant': variant, 'wall_seconds': time.monotonic() - start,
+              'external_full_fallback': fallback, 'exit_code': status,
+              'app_head': subprocess.check_output(['git', '-C', str(root / 'app'),
+                                                    'rev-parse', 'HEAD'], text=True).strip(),
+              'base': os.environ['BASE_SHA'],
+          }, indent=2) + '\n')
+          raise SystemExit(status)
+          PY
+      - name: Unchanged native timezone regression scripts
+        id: timezone
+        if: always() && steps.tests.outcome != 'skipped'
+        continue-on-error: true
+        working-directory: app/pkgs/core
+        run: bash scripts/test/tz.sh
+      - name: Preserve every observed failure
+        if: always()
+        env:
+          TESTS: ${{ steps.tests.outcome }}
+          TIMEZONE: ${{ steps.timezone.outcome }}
+        run: test "$TESTS" = success && test "$TIMEZONE" = success
+      - name: Upload bounded timing evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: timing-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/command-time.json
+            ${{ runner.temp }}/native-full.json
+            ${{ runner.temp }}/smartci-result/audit.md
+            ${{ runner.temp }}/smartci-result/selection.json
+            ${{ runner.temp }}/smartci-result/run.json
+          if-no-files-found: error
+          retention-days: 3
+  cached:
+    needs: fetch-map
+    if: always() && !cancelled() && github.repository == 'SharmaKunal14/date-fns'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    name: timing (cached)
+    steps:
+      - name: Download authenticated map
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-base-map-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verified-map
+      - name: Check out actual PR revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          path: app
+          # Native full execution needs no history; Smart CI genuinely does.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '26.13.1'
+      - name: Install pinned package manager and native dependencies
+        run: |
+          npm install --prefix "$RUNNER_TEMP/package-manager" pnpm@12.21.0
+          node "$RUNNER_TEMP/package-manager/node_modules/pnpm/bin/pnpm.mjs" \
+            --dir app install --frozen-lockfile \
+            --store-dir "$RUNNER_TEMP/pnpm-store" --cache-dir "$RUNNER_TEMP/pnpm-cache"
+      - name: Check out pinned Smart CI
+        id: control
+        continue-on-error: true
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: SharmaKunal14/smart-ci
+          ref: fa7cb1994b98f0c2ddd0e83dd603eb9d127f6f41
+          path: control
+          persist-credentials: false
+      - name: Set up Python
+        id: python
+        continue-on-error: true
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.14'
+      - name: Set up uv
+        id: uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: '0.11.6'
+          enable-cache: false
+      - name: Install pinned Smart CI
+        id: tool
+        if: steps.control.outcome == 'success' && steps.python.outcome == 'success' && steps.uv.outcome == 'success'
+        continue-on-error: true
+        working-directory: control
+        run: uv sync --frozen --no-dev
+      - name: Run measured test command
+        id: tests
+        continue-on-error: true
+        env:
+          VARIANT: cached
+          MAP_DIGEST: ${{ needs.fetch-map.outputs.sha256 }}
+          TOOL_READY: ${{ steps.tool.outcome }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TZ: UTC
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+          from pathlib import Path
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          temporary = Path(os.environ['RUNNER_TEMP'])
+          variant = os.environ['VARIANT']
+          start = time.monotonic()
+          full = ['node', '../../node_modules/vitest/vitest.mjs', 'run',
+                  '--project', 'main', '--reporter=json',
+                  f'--outputFile={temporary / "native-full.json"}']
+          fallback = False
+          if variant != 'native' and os.environ['TOOL_READY'] == 'success':
+              command = [str(root / 'control/.venv/bin/smartci'), 'typescript', 'run',
+                         '--repo', str(root / 'app'),
+                         '--config', str(root / 'control/examples/date-fns/typescript.json'),
+                         '--base', os.environ['BASE_SHA'],
+                         '--output', str(temporary / 'smartci-result'),
+                         '--pnpm', str(temporary / 'package-manager/node_modules/pnpm/bin/pnpm.mjs'),
+                         '--dependency-store', str(temporary / 'pnpm-store'),
+                         '--dependency-cache', str(temporary / 'pnpm-cache')]
+              command += ['--base-map', str(temporary / 'verified-map/base-map.json'),
+                          '--base-map-sha256', os.environ['MAP_DIGEST']]
+              try:
+                  status = subprocess.run(command, check=False, timeout=300).returncode
+              except (OSError, subprocess.TimeoutExpired):
+                  status = 2
+          else:
+              status = 2
+          if variant == 'native' or status not in (0, 1):
+              fallback = variant != 'native'
+              status = subprocess.run(full, cwd=root / 'app/pkgs/core',
+                                      check=False, timeout=180).returncode
+          (temporary / 'command-time.json').write_text(json.dumps({
+              'variant': variant, 'wall_seconds': time.monotonic() - start,
+              'external_full_fallback': fallback, 'exit_code': status,
+              'app_head': subprocess.check_output(['git', '-C', str(root / 'app'),
+                                                    'rev-parse', 'HEAD'], text=True).strip(),
+              'base': os.environ['BASE_SHA'],
+          }, indent=2) + '\n')
+          raise SystemExit(status)
+          PY
+      - name: Unchanged native timezone regression scripts
+        id: timezone
+        if: always() && steps.tests.outcome != 'skipped'
+        continue-on-error: true
+        working-directory: app/pkgs/core
+        run: bash scripts/test/tz.sh
+      - name: Preserve every observed failure
+        if: always()
+        env:
+          TESTS: ${{ steps.tests.outcome }}
+          TIMEZONE: ${{ steps.timezone.outcome }}
+        run: test "$TESTS" = success && test "$TIMEZONE" = success
+      - name: Upload bounded timing evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: timing-cached-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/verified-map/receipt.json
+            ${{ runner.temp }}/command-time.json
+            ${{ runner.temp }}/native-full.json
+            ${{ runner.temp }}/smartci-result/audit.md
+            ${{ runner.temp }}/smartci-result/selection.json
+            ${{ runner.temp }}/smartci-result/run.json
+          if-no-files-found: error
+          retention-days: 3
