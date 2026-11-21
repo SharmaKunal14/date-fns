@@ -23,7 +23,7 @@ jobs:
           - variant: previous
             tool_ref: 456ddca0b02ec4c7ad34bafd8a6310d9cdf83d29
           - variant: smartci
-            tool_ref: 721ad87ec7416a850a714267499b7d46384fa1a3
+            tool_ref: dba776ab7d4d7e1b1e463a23bb55154fa9dd08dc
     name: timing (${{ matrix.variant }})
     steps:
       - name: Check out actual PR revision
